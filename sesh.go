@@ -2,20 +2,28 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-type CreateSessionOp struct {
+type CreateSessionRequest struct {
 	Name *string
 }
 
-type Session struct {
+type CreateSessionResponse struct {
 	Id uuid.UUID
-	CreateSessionOp
+}
+
+type Session struct {
+	Id           uuid.UUID
+	Name         string
 	CreationTime string
 	Filepath     string
 }
@@ -24,19 +32,20 @@ type ListSession struct {
 	Sessions []Session
 }
 
-// Perform command line or environment checks
-func CanRun() bool {
-	return true
+func CheckError(err error) {
+	if err != nil {
+		log.Fatal(err.Error())
+	}
 }
 
 func main() {
-
-	if !CanRun() {
-		log.Fatal("Can't run because environment variables haven't been set")
-	}
+	defaultPath, osError := os.Getwd()
+	CheckError(osError)
+	logDir := flag.String("log-dir", defaultPath, "Directory to put all log files")
 
 	// Session related channels
-	createSessionOps := make(chan CreateSessionOp, 1)
+	createSessionReq := make(chan CreateSessionRequest)
+	createSessionRes := make(chan CreateSessionResponse)
 	listSessionReq := make(chan bool)
 	listSessionResp := make(chan []Session)
 
@@ -47,14 +56,16 @@ func main() {
 
 		for {
 			select {
-			case createSession := <-createSessionOps:
-				id, _ := uuid.NewUUID()
+			case createSession := <-createSessionReq:
+				id, _ := uuid.NewRandom()
+				creationTime := time.Now().Format(time.RFC3339)
 				sessions[id] = Session{
-					Id:              id,
-					CreateSessionOp: createSession,
-					CreationTime:    time.Now().Format(time.RFC3339),
-					Filepath:        "some/path",
+					Id:           id,
+					Name:         *createSession.Name,
+					CreationTime: creationTime,
+					Filepath:     filepath.Join(*logDir, fmt.Sprintf("%s-%s-%s", *createSession.Name, creationTime, id.String()[:8])),
 				}
+				createSessionRes <- CreateSessionResponse{id}
 			case <-listSessionReq:
 				var results []Session
 				for k := range sessions {
@@ -70,7 +81,7 @@ func main() {
 		switch r.Method {
 		case "POST":
 			decoder := json.NewDecoder(r.Body)
-			var newSession CreateSessionOp
+			var newSession CreateSessionRequest
 			err := decoder.Decode(&newSession)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -80,7 +91,13 @@ func main() {
 				http.Error(w, "Invalid create session object", http.StatusBadRequest)
 				return
 			}
-			createSessionOps <- newSession
+			createSessionReq <- newSession
+			response := <-createSessionRes
+
+			json.NewEncoder(w).Encode(response)
+			w.Header().Add("Content-Type", "application/json")
+			w.Header().Add("Status", fmt.Sprint(http.StatusOK))
+			fmt.Printf("Session created with id=%s\n", response.Id)
 		default:
 			http.Error(w, "Not allowed", http.StatusMethodNotAllowed)
 		}
@@ -93,14 +110,12 @@ func main() {
 			listSessionReq <- true
 			sessions := <-listSessionResp
 			json.NewEncoder(w).Encode(ListSession{sessions})
-			w.Header().Add("Status", "200")
+			w.Header().Add("Status", fmt.Sprint(http.StatusOK))
 		default:
 			http.Error(w, "Not allowed", http.StatusMethodNotAllowed)
 		}
 	})
 
 	err := http.ListenAndServe(":8080", nil)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
+	CheckError(err)
 }
