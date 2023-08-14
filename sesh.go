@@ -21,6 +21,15 @@ type CreateSessionResponse struct {
 	Id uuid.UUID
 }
 
+type CloseSessionRequest struct {
+	Id *uuid.UUID
+}
+
+type CloseSessionResponse struct {
+	Message string
+	Status  uint
+}
+
 type Session struct {
 	Id           uuid.UUID
 	Name         string
@@ -47,7 +56,9 @@ func main() {
 	createSessionReq := make(chan CreateSessionRequest)
 	createSessionRes := make(chan CreateSessionResponse)
 	listSessionReq := make(chan bool)
-	listSessionResp := make(chan []Session)
+	listSessionRes := make(chan []Session)
+	closeSessionReq := make(chan CloseSessionRequest)
+	closeSessionRes := make(chan CloseSessionResponse)
 
 	// Session manager
 	go func() {
@@ -71,7 +82,16 @@ func main() {
 				for k := range sessions {
 					results = append(results, sessions[k])
 				}
-				listSessionResp <- results
+				listSessionRes <- results
+			case closeSession := <-closeSessionReq:
+				id := *closeSession.Id
+				_, exists := sessions[id]
+				if exists {
+					delete(sessions, id)
+					closeSessionRes <- CloseSessionResponse{fmt.Sprintf("Successfully closed session with id %s\n", id.String()), http.StatusOK}
+				} else {
+					closeSessionRes <- CloseSessionResponse{fmt.Sprintf("Session id %s does not exist\n", id.String()), http.StatusBadRequest}
+				}
 			}
 		}
 
@@ -108,11 +128,23 @@ func main() {
 		case "GET":
 			w.Header().Add("Content-Type", "application/json")
 			listSessionReq <- true
-			sessions := <-listSessionResp
+			sessions := <-listSessionRes
 			json.NewEncoder(w).Encode(ListSession{sessions})
 			w.Header().Add("Status", fmt.Sprint(http.StatusOK))
 		default:
 			http.Error(w, "Not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	http.HandleFunc("/close-session", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "POST":
+			var closeSession CloseSessionRequest
+			json.NewDecoder(r.Body).Decode(&closeSession)
+			closeSessionReq <- closeSession
+			result := <-closeSessionRes
+			w.Header().Add("Status", fmt.Sprint(result.Status))
+			fmt.Fprintf(w, result.Message)
 		}
 	})
 
