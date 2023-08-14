@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +13,11 @@ import (
 
 	"github.com/google/uuid"
 )
+
+type MessageAndStatus struct {
+	Message string
+	Status  uint
+}
 
 type CreateSessionRequest struct {
 	Name *string
@@ -25,10 +31,14 @@ type CloseSessionRequest struct {
 	Id *uuid.UUID
 }
 
-type CloseSessionResponse struct {
-	Message string
-	Status  uint
+type CloseSessionResponse MessageAndStatus
+
+type WriteSessionRequest struct {
+	Id      *uuid.UUID
+	Content *string
 }
+
+type WriteSessionResponse MessageAndStatus
 
 type Session struct {
 	Id           uuid.UUID
@@ -41,10 +51,25 @@ type ListSession struct {
 	Sessions []Session
 }
 
-func CheckError(err error) {
+// Checks if there's an error. Returns 'true' if error is not nil.
+func CheckError(err error) bool {
 	if err != nil {
 		log.Fatal(err.Error())
 	}
+
+	return err == nil
+}
+
+// Create file if it doesn't exist. If file already exists or file is created successfully, 'true' will be returned.
+func MaybeCreateFile(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		if file, err := os.Create(path); err != nil {
+			file.Close()
+			return false
+		}
+	}
+
+	return true
 }
 
 func main() {
@@ -59,6 +84,8 @@ func main() {
 	listSessionRes := make(chan []Session)
 	closeSessionReq := make(chan CloseSessionRequest)
 	closeSessionRes := make(chan CloseSessionResponse)
+	writeSessionReq := make(chan WriteSessionRequest)
+	writeSessionRes := make(chan WriteSessionResponse)
 
 	// Session manager
 	go func() {
@@ -92,6 +119,29 @@ func main() {
 				} else {
 					closeSessionRes <- CloseSessionResponse{fmt.Sprintf("Session id %s does not exist\n", id.String()), http.StatusBadRequest}
 				}
+			case writeSession := <-writeSessionReq:
+				id := *writeSession.Id
+				session := sessions[id]
+
+				if !MaybeCreateFile(session.Filepath) {
+					writeSessionRes <- WriteSessionResponse{"File could not be created", http.StatusInternalServerError}
+					continue
+				}
+
+				file, openErr := os.OpenFile(session.Filepath, os.O_APPEND|os.O_WRONLY, fs.ModeAppend)
+				if openErr != nil {
+					writeSessionRes <- WriteSessionResponse{fmt.Sprintf("%s\n", openErr.Error()), http.StatusInternalServerError}
+				}
+
+				logStatement := fmt.Sprintf("%s Log: %s\n", time.Now().Format(time.RFC3339Nano), *writeSession.Content)
+				if _, writeErr := file.WriteString(logStatement); writeErr != nil {
+					writeSessionRes <- WriteSessionResponse{fmt.Sprintf("%s\n", writeErr.Error()), http.StatusInternalServerError}
+				}
+
+				file.Sync()
+				file.Close()
+
+				writeSessionRes <- WriteSessionResponse{"", http.StatusOK}
 			}
 		}
 
@@ -145,6 +195,22 @@ func main() {
 			result := <-closeSessionRes
 			w.Header().Add("Status", fmt.Sprint(result.Status))
 			fmt.Fprintf(w, result.Message)
+		default:
+			http.Error(w, "Not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	http.HandleFunc("/write-session", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "POST":
+			var writeSession WriteSessionRequest
+			json.NewDecoder(r.Body).Decode(&writeSession)
+			writeSessionReq <- writeSession
+			result := <-writeSessionRes
+			w.Header().Add("Status", fmt.Sprint(result.Status))
+			fmt.Fprintf(w, result.Message)
+		default:
+			http.Error(w, "Not allowed", http.StatusMethodNotAllowed)
 		}
 	})
 
